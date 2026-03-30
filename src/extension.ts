@@ -264,28 +264,7 @@ async function revealSessionInTree(pid: string) {
   }
 }
 
-async function focusWorktreeSCM(cwd: string) {
-  // Find workspace folder matching this worktree
-  const folder = vscode.workspace.workspaceFolders?.find((f) =>
-    cwd.startsWith(f.uri.fsPath),
-  );
-  if (!folder) return;
-
-  // Open a file from that folder to trigger SCM context switch
-  try {
-    const files = await vscode.workspace.findFiles(
-      new vscode.RelativePattern(folder, "package.json"),
-      null,
-      1,
-    );
-    if (files.length > 0) {
-      await vscode.window.showTextDocument(files[0], {
-        preview: true,
-        preserveFocus: true,
-      });
-    }
-  } catch {}
-}
+// TODO: SCM 리포지토리 자동 전환 — VSCode API 한계로 미구현
 
 export function activate(context: vscode.ExtensionContext) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -331,9 +310,6 @@ export function activate(context: vscode.ExtensionContext) {
             return;
           }
         }
-
-        // Focus SCM to matching worktree
-        focusWorktreeSCM(session.info.cwd);
       },
     ),
     vscode.commands.registerCommand("claudeSessionMonitor.focus", () => {
