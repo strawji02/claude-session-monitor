@@ -56,9 +56,15 @@ const sessions = new Map<string, TrackedSession>();
 const terminalPidCache = new Map<vscode.Terminal, number>();
 const localTerminalPids = new Set<number>();
 
+// --- TreeItem Cache (reveal needs same instances) ---
+
+const cachedSessionItems = new Map<string, SessionItem>();
+const cachedWorktreeGroups = new Map<string, WorktreeGroup>();
+let activeTerminalSessionPid: string | undefined;
+
 // --- TreeView ---
 
-type TreeItem = WorktreeGroup | SessionItem;
+type TreeItemType = WorktreeGroup | SessionItem;
 
 class WorktreeGroup extends vscode.TreeItem {
   constructor(
@@ -69,11 +75,11 @@ class WorktreeGroup extends vscode.TreeItem {
     this.contextValue = "worktreeGroup";
     this.iconPath = new vscode.ThemeIcon("folder");
 
-    // If any child needs attention, highlight
     const hasAttention = sessionPids.some((pid) => {
       const s = sessions.get(pid);
       return (
         s &&
+        !s.acknowledged &&
         (s.info.state === "waiting" ||
           s.info.state === "blocked" ||
           s.info.state === "done")
@@ -89,7 +95,10 @@ class WorktreeGroup extends vscode.TreeItem {
 }
 
 class SessionItem extends vscode.TreeItem {
-  constructor(public readonly session: TrackedSession) {
+  constructor(
+    public readonly session: TrackedSession,
+    public readonly isActive: boolean,
+  ) {
     const info = session.info;
     const label = info.label || info.branch || info.worktree;
     super(label, vscode.TreeItemCollapsibleState.None);
@@ -102,9 +111,13 @@ class SessionItem extends vscode.TreeItem {
     } else {
       this.iconPath = STATE_THEME_ICONS[info.state];
     }
-    this.description = info.message || STATE_LABELS[info.state];
+
+    // Description: active indicator + message
+    const activePrefix = isActive ? "► " : "";
+    this.description = `${activePrefix}${info.message || STATE_LABELS[info.state]}`;
+
     this.tooltip = new vscode.MarkdownString(
-      `**${STATE_LABELS[info.state]}**\n\n` +
+      `**${STATE_LABELS[info.state]}**${isActive ? " (active)" : ""}\n\n` +
         `- Branch: \`${info.branch || "N/A"}\`\n` +
         `- Path: \`${info.cwd}\`\n` +
         `- PID: ${info.pid}`,
@@ -119,47 +132,71 @@ class SessionItem extends vscode.TreeItem {
   }
 }
 
-class SessionTreeProvider implements vscode.TreeDataProvider<TreeItem> {
+class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType> {
   private _onDidChangeTreeData = new vscode.EventEmitter<
-    TreeItem | undefined | null | void
+    TreeItemType | undefined | null | void
   >();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
   refresh(): void {
+    // Clear caches so getChildren rebuilds
+    cachedSessionItems.clear();
+    cachedWorktreeGroups.clear();
     this._onDidChangeTreeData.fire();
   }
 
-  getTreeItem(element: TreeItem): vscode.TreeItem {
+  getTreeItem(element: TreeItemType): vscode.TreeItem {
     return element;
   }
 
-  getChildren(element?: TreeItem): TreeItem[] {
+  getParent(element: TreeItemType): TreeItemType | undefined {
+    if (element instanceof SessionItem) {
+      const wt = element.session.info.worktree;
+      return cachedWorktreeGroups.get(wt);
+    }
+    return undefined;
+  }
+
+  getChildren(element?: TreeItemType): TreeItemType[] {
     if (!element) {
-      // Root: group by worktree, sorted
       const groups = new Map<string, string[]>();
-      for (const [pid, session] of sessions) {
-        const wt = session.info.worktree;
+      for (const [pid] of sessions) {
+        const wt = sessions.get(pid)!.info.worktree;
         if (!groups.has(wt)) groups.set(wt, []);
         groups.get(wt)!.push(pid);
       }
 
       const sortedWorktrees = [...groups.keys()].sort();
 
-      // If only one worktree, skip grouping
+      // Single worktree: no grouping
       if (sortedWorktrees.length <= 1 && sortedWorktrees.length > 0) {
         const pids = groups.get(sortedWorktrees[0])!;
-        return pids.sort().map((pid) => new SessionItem(sessions.get(pid)!));
+        return pids.sort().map((pid) => {
+          const item = new SessionItem(
+            sessions.get(pid)!,
+            pid === activeTerminalSessionPid,
+          );
+          cachedSessionItems.set(pid, item);
+          return item;
+        });
       }
 
-      return sortedWorktrees.map(
-        (wt) => new WorktreeGroup(wt, groups.get(wt)!),
-      );
+      return sortedWorktrees.map((wt) => {
+        const group = new WorktreeGroup(wt, groups.get(wt)!);
+        cachedWorktreeGroups.set(wt, group);
+        return group;
+      });
     }
 
     if (element instanceof WorktreeGroup) {
-      return element.sessionPids
-        .sort()
-        .map((pid) => new SessionItem(sessions.get(pid)!));
+      return element.sessionPids.sort().map((pid) => {
+        const item = new SessionItem(
+          sessions.get(pid)!,
+          pid === activeTerminalSessionPid,
+        );
+        cachedSessionItems.set(pid, item);
+        return item;
+      });
     }
 
     return [];
@@ -207,13 +244,55 @@ function updateSummaryStatusBar() {
 
 let watcher: fs.FSWatcher | undefined;
 let treeProvider: SessionTreeProvider;
+let treeView: vscode.TreeView<TreeItemType>;
+
+function findSessionByTerminal(terminal: vscode.Terminal): string | undefined {
+  for (const [pid, session] of sessions) {
+    if (session.terminal === terminal) return pid;
+  }
+  return undefined;
+}
+
+async function revealSessionInTree(pid: string) {
+  const item = cachedSessionItems.get(pid);
+  if (item && treeView.visible) {
+    try {
+      await treeView.reveal(item, { select: true, focus: false, expand: true });
+    } catch {
+      // TreeItem might be stale, refresh and retry
+    }
+  }
+}
+
+async function focusWorktreeSCM(cwd: string) {
+  // Find workspace folder matching this worktree
+  const folder = vscode.workspace.workspaceFolders?.find((f) =>
+    cwd.startsWith(f.uri.fsPath),
+  );
+  if (!folder) return;
+
+  // Open a file from that folder to trigger SCM context switch
+  try {
+    const files = await vscode.workspace.findFiles(
+      new vscode.RelativePattern(folder, "package.json"),
+      null,
+      1,
+    );
+    if (files.length > 0) {
+      await vscode.window.showTextDocument(files[0], {
+        preview: true,
+        preserveFocus: true,
+      });
+    }
+  } catch {}
+}
 
 export function activate(context: vscode.ExtensionContext) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
 
   // TreeView
   treeProvider = new SessionTreeProvider();
-  const treeView = vscode.window.createTreeView("claudeSessionMonitor", {
+  treeView = vscode.window.createTreeView("claudeSessionMonitor", {
     treeDataProvider: treeProvider,
     showCollapseAll: true,
   });
@@ -249,8 +328,12 @@ export function activate(context: vscode.ExtensionContext) {
             vscode.window.showWarningMessage(
               `터미널을 찾을 수 없습니다: ${session.info.worktree}`,
             );
+            return;
           }
         }
+
+        // Focus SCM to matching worktree
+        focusWorktreeSCM(session.info.cwd);
       },
     ),
     vscode.commands.registerCommand("claudeSessionMonitor.focus", () => {
@@ -285,12 +368,44 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions,
   );
 
+  // Terminal focus → TreeView sync
+  vscode.window.onDidChangeActiveTerminal(
+    (terminal) => {
+      if (!terminal) {
+        activeTerminalSessionPid = undefined;
+        refreshAll();
+        return;
+      }
+
+      const pid = findSessionByTerminal(terminal);
+      if (pid && pid !== activeTerminalSessionPid) {
+        activeTerminalSessionPid = pid;
+        refreshAll();
+
+        // Wait for tree to rebuild, then reveal
+        setTimeout(() => revealSessionInTree(pid), 150);
+      }
+    },
+    null,
+    context.subscriptions,
+  );
+
   // Init
   cleanStaleFiles();
   const initPromises = vscode.window.terminals.map((t) => cacheTerminalPid(t));
   Promise.all(initPromises).then(() => {
     loadAllStates();
     refreshAll();
+
+    // Set initial active terminal
+    const activeTerminal = vscode.window.activeTerminal;
+    if (activeTerminal) {
+      const pid = findSessionByTerminal(activeTerminal);
+      if (pid) {
+        activeTerminalSessionPid = pid;
+        refreshAll();
+      }
+    }
   });
 
   // File watcher
@@ -459,7 +574,6 @@ function loadStateFile(filePath: string) {
 
     const existing = sessions.get(pid);
     if (existing) {
-      // 상태가 바뀌면 acknowledged 리셋
       if (existing.info.state !== info.state) {
         existing.acknowledged = false;
       }
@@ -493,4 +607,6 @@ export function deactivate() {
   sessions.clear();
   terminalPidCache.clear();
   localTerminalPids.clear();
+  cachedSessionItems.clear();
+  cachedWorktreeGroups.clear();
 }

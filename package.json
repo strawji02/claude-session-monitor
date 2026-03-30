@@ -2,13 +2,17 @@
   "name": "claude-session-monitor",
   "displayName": "Claude Session Monitor",
   "description": "Monitor multiple Claude Code CLI sessions - see which needs attention and click to jump",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "planfit",
   "engines": {
     "vscode": "^1.93.0"
   },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
